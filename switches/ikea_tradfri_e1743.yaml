@@ -1,0 +1,252 @@
+blueprint:
+  name: IKEA E1743 – light with themes (Zigbee2MQTT)
+  description: >
+    Control a light with the two-button IKEA TRADFRI on/off switch (E1743) via Zigbee2MQTT.
+
+    Button I: if the light is off, turns it on. If it is on, switches to the next theme (scene).
+    Holding I increases brightness.
+
+    Button O: press turns the light off, hold decreases brightness (only when the light is on).
+    Triple-click O always turns off the whole room.
+  domain: automation
+  input:
+    remote:
+      name: E1743 remote
+      description: Your TRADFRI on/off switch from Zigbee2MQTT.
+      selector:
+        device:
+          filter:
+            - integration: mqtt
+    light:
+      name: Light
+      description: The light controlled by the switch.
+      selector:
+        entity:
+          filter:
+            - domain: light
+    themes:
+      name: Themes (scenes)
+      description: >
+        Scenes cycled through with button I while the light is on
+        (reading, night light, focus…). You can add them later.
+      default: []
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - domain: scene
+    theme_index:
+      name: Theme index helper
+      description: >
+        Number helper (input_number) where the automation stores which theme
+        is currently active. Min 0, max 20, step 1 is enough.
+      selector:
+        entity:
+          filter:
+            - domain: input_number
+    room:
+      name: Room for triple-click
+      description: What turns off on a triple-click of O (an area or specific lights).
+      selector:
+        target:
+          entity:
+            - domain: light
+    dim_step:
+      name: Dimming step
+      description: How many percent the brightness changes with each step while holding.
+      default: 10
+      selector:
+        number:
+          min: 1
+          max: 30
+          step: 1
+          unit_of_measurement: "%"
+    dim_delay:
+      name: Dimming speed
+      description: Delay between steps while the button is held.
+      default: 300
+      selector:
+        number:
+          min: 100
+          max: 1000
+          step: 50
+          unit_of_measurement: ms
+    click_window:
+      name: Triple-click window
+      description: Maximum time between presses for them to count as a triple-click.
+      default: 600
+      selector:
+        number:
+          min: 200
+          max: 1500
+          step: 50
+          unit_of_measurement: ms
+
+mode: single
+max_exceeded: silent
+
+variables:
+  light_entity: !input light
+  themes: !input themes
+  theme_index: !input theme_index
+  dim_step: !input dim_step
+  dim_delay: !input dim_delay
+  click_window: !input click_window
+  step_abs: "{{ (dim_step * 2.55) | int }}"
+
+triggers:
+  - trigger: device
+    domain: mqtt
+    device_id: !input remote
+    type: action
+    subtype: "on"
+    id: "on"
+  - trigger: device
+    domain: mqtt
+    device_id: !input remote
+    type: action
+    subtype: "off"
+    id: "off"
+  - trigger: device
+    domain: mqtt
+    device_id: !input remote
+    type: action
+    subtype: brightness_move_up
+    id: up
+  - trigger: device
+    domain: mqtt
+    device_id: !input remote
+    type: action
+    subtype: brightness_move_down
+    id: down
+
+actions:
+  - choose:
+      # ---------- Button I: short press ----------
+      - conditions:
+          - condition: trigger
+            id: "on"
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ is_state(light_entity, 'off') }}"
+            then:
+              - action: light.turn_on
+                target:
+                  entity_id: "{{ light_entity }}"
+            else:
+              # Light is on -> next theme
+              - condition: template
+                value_template: "{{ themes | count > 0 }}"
+              - variables:
+                  next_idx: >
+                    {{ ((states(theme_index) | float(-1) | int) + 1) % (themes | count) }}
+              - action: input_number.set_value
+                target:
+                  entity_id: "{{ theme_index }}"
+                data:
+                  value: "{{ next_idx }}"
+              - action: scene.turn_on
+                target:
+                  entity_id: "{{ themes[next_idx | int] }}"
+
+      # ---------- Button I: hold = increase brightness ----------
+      - conditions:
+          - condition: trigger
+            id: up
+        sequence:
+          - repeat:
+              sequence:
+                - action: light.turn_on
+                  target:
+                    entity_id: "{{ light_entity }}"
+                  data:
+                    brightness: >
+                      {{ [ (state_attr(light_entity, 'brightness') | int(0)) + step_abs, 255 ] | min }}
+                    transition: "{{ dim_delay / 1000 }}"
+                - wait_for_trigger:
+                    - trigger: device
+                      domain: mqtt
+                      device_id: !input remote
+                      type: action
+                      subtype: brightness_stop
+                  timeout:
+                    milliseconds: "{{ dim_delay }}"
+                  continue_on_timeout: true
+              until:
+                - condition: template
+                  value_template: >
+                    {{ wait.trigger is not none
+                       or repeat.index >= 30
+                       or (state_attr(light_entity, 'brightness') | int(0)) >= 255 }}
+
+      # ---------- Button O: hold = decrease brightness (only when on) ----------
+      - conditions:
+          - condition: trigger
+            id: down
+          - condition: template
+            value_template: "{{ is_state(light_entity, 'on') }}"
+        sequence:
+          - repeat:
+              sequence:
+                - action: light.turn_on
+                  target:
+                    entity_id: "{{ light_entity }}"
+                  data:
+                    brightness: >
+                      {{ [ (state_attr(light_entity, 'brightness') | int(0)) - step_abs, 3 ] | max }}
+                    transition: "{{ dim_delay / 1000 }}"
+                - wait_for_trigger:
+                    - trigger: device
+                      domain: mqtt
+                      device_id: !input remote
+                      type: action
+                      subtype: brightness_stop
+                  timeout:
+                    milliseconds: "{{ dim_delay }}"
+                  continue_on_timeout: true
+              until:
+                - condition: template
+                  value_template: >
+                    {{ wait.trigger is not none
+                       or repeat.index >= 30
+                       or (state_attr(light_entity, 'brightness') | int(0)) <= 3 }}
+
+      # ---------- Button O: press = turn off, triple-click = turn off room ----------
+      - conditions:
+          - condition: trigger
+            id: "off"
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ is_state(light_entity, 'on') }}"
+            then:
+              - action: light.turn_off
+                target:
+                  entity_id: "{{ light_entity }}"
+          # second press
+          - wait_for_trigger:
+              - trigger: device
+                domain: mqtt
+                device_id: !input remote
+                type: action
+                subtype: "off"
+            timeout:
+              milliseconds: "{{ click_window }}"
+            continue_on_timeout: true
+          - condition: template
+            value_template: "{{ wait.trigger is not none }}"
+          # third press
+          - wait_for_trigger:
+              - trigger: device
+                domain: mqtt
+                device_id: !input remote
+                type: action
+                subtype: "off"
+            timeout:
+              milliseconds: "{{ click_window }}"
+            continue_on_timeout: true
+          - condition: template
+            value_template: "{{ wait.trigger is not none }}"
+          - action: light.turn_off
+            target: !input room

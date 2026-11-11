@@ -82,7 +82,8 @@ blueprint:
           step: 50
           unit_of_measurement: ms
 
-mode: single
+mode: parallel
+max: 10
 max_exceeded: silent
 
 variables:

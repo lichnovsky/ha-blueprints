@@ -1,17 +1,21 @@
 blueprint:
-  name: IKEA STYRBAR – light with themes (Zigbee2MQTT)
+  name: IKEA STYRBAR – lights with themes (Zigbee2MQTT)
   description: >
-    Control a light with the four-button IKEA STYRBAR remote (E2001/E2002) via Zigbee2MQTT.
+    Control a room or lights with the four-button IKEA STYRBAR remote (E2001/E2002)
+    via Zigbee2MQTT.
 
-    Up button: turns the light on (where it left off, or with a chosen scene).
-    Holding it increases brightness.
+    Up button: turns all the lights on (where they left off, or with a chosen
+    scene). Holding it increases brightness.
 
-    Down button: press turns the light off, hold decreases brightness (only when the light is on).
+    Down button: press turns all the lights off, hold decreases brightness
+    (stops before the dimmest light would turn off).
 
     Right / left arrow: switch to the next / previous theme (scene).
-    If the light is off, the arrow turns it on with that theme.
-    Holding left / right makes the light warmer / colder (only when the light is on
-    and supports color temperature).
+    Holding left / right makes the lights warmer / colder (only lights that are on
+    and support color temperature).
+
+    Dimming and color temperature change every light relative to its own value,
+    so the ratios from a scene are kept.
 
     Note: Zigbee2MQTT creates the MQTT device triggers only after an action has
     been seen once, so press (and hold) every button once before setting up the
@@ -26,11 +30,13 @@ blueprint:
           filter:
             - integration: mqtt
     light:
-      name: Light
-      description: The light controlled by the remote.
+      name: Room or lights
+      description: >
+        What the remote controls: a room (area), a floor, a label, devices or
+        individual lights. Light groups (Home Assistant or Zigbee2MQTT) work too.
       selector:
-        entity:
-          filter:
+        target:
+          entity:
             - domain: light
     themes:
       name: Themes (scenes)
@@ -46,8 +52,8 @@ blueprint:
     turn_on_scene:
       name: Turn-on scene
       description: >
-        How the light turns on with the up button. Leave empty to resume where
-        it left off (last brightness and color), or pick a scene to always turn
+        How the lights turn on with the up button. Leave empty to resume where
+        they left off (last brightness and color), or pick a scene to always turn
         on with it. If the scene is one of the themes, the arrows continue from
         it.
       default: ""
@@ -100,14 +106,39 @@ max: 10
 max_exceeded: silent
 
 variables:
-  light_entity: !input light
+  light_target: !input light
   themes: !input themes
   turn_on_scene: !input turn_on_scene
   theme_index: !input theme_index
   dim_step: !input dim_step
-  dim_delay: !input dim_delay
   temp_step: !input temp_step
+  dim_delay: !input dim_delay
   step_abs: "{{ (dim_step * 2.55) | int }}"
+  # Lights behind the target; only used for dimming limit and color temperature
+  lights: >
+    {% set t = light_target if light_target is mapping else {'entity_id': light_target} %}
+    {% macro as_list(v) %}{{ ([v] if v is string else (v or [])) | to_json }}{% endmacro %}
+    {% set ns = namespace(e=[], areas=[], out=[]) %}
+    {% set ns.e = as_list(t.get('entity_id')) | from_json %}
+    {% set ns.areas = as_list(t.get('area_id')) | from_json %}
+    {% for f in as_list(t.get('floor_id')) | from_json %}
+      {% set ns.areas = ns.areas + floor_areas(f) %}
+    {% endfor %}
+    {% for a in ns.areas %}
+      {% set ns.e = ns.e + area_entities(a) %}
+    {% endfor %}
+    {% for d in as_list(t.get('device_id')) | from_json %}
+      {% set ns.e = ns.e + device_entities(d) %}
+    {% endfor %}
+    {% for l in as_list(t.get('label_id')) | from_json %}
+      {% set ns.e = ns.e + label_entities(l) %}
+    {% endfor %}
+    {% for e in ns.e | select('match', 'light\.') | unique %}
+      {% if state_attr(e, 'entity_id') is none %}
+        {% set ns.out = ns.out + [e] %}
+      {% endif %}
+    {% endfor %}
+    {{ ns.out }}
 
 triggers:
   - trigger: device
@@ -161,18 +192,15 @@ triggers:
 
 actions:
   - choose:
-      # ---------- Up: press = turn on ----------
+      # ---------- Up: press = turn everything on ----------
       - conditions:
           - condition: trigger
             id: "on"
-          - condition: template
-            value_template: "{{ is_state(light_entity, 'off') }}"
         sequence:
           - if:
               - condition: template
                 value_template: "{{ turn_on_scene | length > 0 }}"
             then:
-              # Turn on with the chosen scene
               - action: scene.turn_on
                 target:
                   entity_id: "{{ turn_on_scene }}"
@@ -186,21 +214,16 @@ actions:
                     data:
                       value: "{{ themes.index(turn_on_scene) }}"
             else:
-              # Resume where it left off
               - action: light.turn_on
-                target:
-                  entity_id: "{{ light_entity }}"
+                target: !input light
 
-      # ---------- Down: press = turn off ----------
+      # ---------- Down: press = turn everything off ----------
       - conditions:
           - condition: trigger
             id: "off"
-          - condition: template
-            value_template: "{{ is_state(light_entity, 'on') }}"
         sequence:
           - action: light.turn_off
-            target:
-              entity_id: "{{ light_entity }}"
+            target: !input light
 
       # ---------- Arrows: next / previous theme ----------
       - conditions:
@@ -215,12 +238,10 @@ actions:
               current_idx: "{{ states(theme_index) | float(-1) | int }}"
               new_idx: >
                 {% set n = themes | count %}
-                {% if is_state(light_entity, 'off') and current_idx >= 0 and current_idx < n %}
-                  {{ current_idx }}
-                {% elif trigger.id == 'next' %}
-                  {{ (current_idx + 1) % n }}
+                {% if current_idx < 0 %}
+                  {{ 0 if trigger.id == 'next' else n - 1 }}
                 {% else %}
-                  {{ (current_idx - 1) % n }}
+                  {{ (current_idx + (1 if trigger.id == 'next' else -1)) % n }}
                 {% endif %}
           - action: input_number.set_value
             target:
@@ -231,51 +252,24 @@ actions:
             target:
               entity_id: "{{ themes[new_idx | int] }}"
 
-      # ---------- Up: hold = increase brightness ----------
+      # ---------- Up / Down: hold = brighter / dimmer ----------
       - conditions:
           - condition: trigger
-            id: up
+            id:
+              - up
+              - down
         sequence:
-          - repeat:
-              sequence:
-                - action: light.turn_on
-                  target:
-                    entity_id: "{{ light_entity }}"
-                  data:
-                    brightness: >
-                      {{ [ (state_attr(light_entity, 'brightness') | int(0)) + step_abs, 255 ] | min }}
-                    transition: "{{ dim_delay / 1000 }}"
-                - wait_for_trigger:
-                    - trigger: device
-                      domain: mqtt
-                      device_id: !input remote
-                      type: action
-                      subtype: brightness_stop
-                  timeout:
-                    milliseconds: "{{ dim_delay }}"
-                  continue_on_timeout: true
-              until:
-                - condition: template
-                  value_template: >
-                    {{ wait.trigger is not none
-                       or repeat.index >= 30
-                       or (state_attr(light_entity, 'brightness') | int(0)) >= 255 }}
-
-      # ---------- Down: hold = decrease brightness (only when on) ----------
-      - conditions:
-          - condition: trigger
-            id: down
           - condition: template
-            value_template: "{{ is_state(light_entity, 'on') }}"
-        sequence:
+            value_template: >
+              {% set on = lights | select('is_state', 'on') | list %}
+              {{ trigger.id == 'up' or on | count == 0
+                 or on | map('state_attr', 'brightness') | map('int', 0) | min > step_abs }}
           - repeat:
               sequence:
                 - action: light.turn_on
-                  target:
-                    entity_id: "{{ light_entity }}"
+                  target: !input light
                   data:
-                    brightness: >
-                      {{ [ (state_attr(light_entity, 'brightness') | int(0)) - step_abs, 3 ] | max }}
+                    brightness_step_pct: "{{ dim_step if trigger.id == 'up' else -dim_step }}"
                     transition: "{{ dim_delay / 1000 }}"
                 - wait_for_trigger:
                     - trigger: device
@@ -289,39 +283,50 @@ actions:
               until:
                 - condition: template
                   value_template: >
+                    {% set on = lights | select('is_state', 'on') | list %}
                     {{ wait.trigger is not none
                        or repeat.index >= 30
-                       or (state_attr(light_entity, 'brightness') | int(0)) <= 3 }}
+                       or (trigger.id == 'down' and on | count > 0
+                           and on | map('state_attr', 'brightness') | map('int', 0) | min <= step_abs) }}
 
-      # ---------- Arrows: hold = warmer (left) / colder (right) ----------
+      # ---------- Arrows: hold = warmer (left) / colder (right), per light ----------
       - conditions:
           - condition: trigger
             id:
               - warmer
               - colder
-          - condition: template
-            value_template: >
-              {{ is_state(light_entity, 'on')
-                 and 'color_temp' in (state_attr(light_entity, 'supported_color_modes') or []) }}
         sequence:
           - variables:
               direction: "{{ -1 if trigger.id == 'warmer' else 1 }}"
-              min_k: "{{ state_attr(light_entity, 'min_color_temp_kelvin') | int(2200) }}"
-              max_k: "{{ state_attr(light_entity, 'max_color_temp_kelvin') | int(4000) }}"
+              ct_targets: >
+                {% set ns = namespace(out=[]) %}
+                {% for e in lights | select('is_state', 'on') %}
+                  {% if 'color_temp' in (state_attr(e, 'supported_color_modes') or []) %}
+                    {% set ns.out = ns.out + [e] %}
+                  {% endif %}
+                {% endfor %}
+                {{ ns.out }}
+          - condition: template
+            value_template: "{{ ct_targets | count > 0 }}"
           - repeat:
               sequence:
-                - variables:
-                    # If the light is in a color mode (e.g. RGB scene), start from the middle
-                    current_k: >
-                      {{ state_attr(light_entity, 'color_temp_kelvin')
-                         | int(((min_k + max_k) / 2) | int) }}
-                - action: light.turn_on
-                  target:
-                    entity_id: "{{ light_entity }}"
-                  data:
-                    color_temp_kelvin: >
-                      {{ [ [ current_k + direction * temp_step, min_k ] | max, max_k ] | min | int }}
-                    transition: "{{ dim_delay / 1000 }}"
+                - repeat:
+                    for_each: "{{ ct_targets }}"
+                    sequence:
+                      - variables:
+                          min_k: "{{ state_attr(repeat.item, 'min_color_temp_kelvin') | int(2200) }}"
+                          max_k: "{{ state_attr(repeat.item, 'max_color_temp_kelvin') | int(4000) }}"
+                          # In a color mode (e.g. RGB scene) there is no temperature, start from the middle
+                          current_k: >
+                            {{ state_attr(repeat.item, 'color_temp_kelvin')
+                               | int(((min_k + max_k) / 2) | int) }}
+                      - action: light.turn_on
+                        target:
+                          entity_id: "{{ repeat.item }}"
+                        data:
+                          color_temp_kelvin: >
+                            {{ [ [ current_k + direction * temp_step, min_k ] | max, max_k ] | min | int }}
+                          transition: "{{ dim_delay / 1000 }}"
                 - wait_for_trigger:
                     - trigger: device
                       domain: mqtt
@@ -338,9 +343,4 @@ actions:
                   continue_on_timeout: true
               until:
                 - condition: template
-                  value_template: >
-                    {% set k = state_attr(light_entity, 'color_temp_kelvin') | int(0) %}
-                    {{ wait.trigger is not none
-                       or repeat.index >= 30
-                       or (direction < 0 and k <= min_k)
-                       or (direction > 0 and k >= max_k) }}
+                  value_template: "{{ wait.trigger is not none or repeat.index >= 30 }}"

@@ -3,7 +3,8 @@ blueprint:
   description: >
     Control a light with the two-button IKEA TRADFRI on/off switch (E1743) via Zigbee2MQTT.
 
-    Button I: if the light is off, turns it on. If it is on, switches to the next theme (scene).
+    Button I: if the light is off, turns it on (where it left off, or with a chosen scene).
+    If it is on, switches to the next theme (scene).
     Holding I increases brightness.
 
     Button O: press turns the light off, hold decreases brightness (only when the light is on).
@@ -33,6 +34,18 @@ blueprint:
       selector:
         entity:
           multiple: true
+          filter:
+            - domain: scene
+    turn_on_scene:
+      name: Turn-on scene
+      description: >
+        How the light turns on with button I. Leave empty to resume where it
+        left off (last brightness and color), or pick a scene to always turn on
+        with it. If the scene is one of the themes, the next press of I
+        continues with the theme after it.
+      default: ""
+      selector:
+        entity:
           filter:
             - domain: scene
     theme_index:
@@ -89,6 +102,7 @@ max_exceeded: silent
 variables:
   light_entity: !input light
   themes: !input themes
+  turn_on_scene: !input turn_on_scene
   theme_index: !input theme_index
   dim_step: !input dim_step
   dim_delay: !input dim_delay
@@ -132,9 +146,28 @@ actions:
               - condition: template
                 value_template: "{{ is_state(light_entity, 'off') }}"
             then:
-              - action: light.turn_on
-                target:
-                  entity_id: "{{ light_entity }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ turn_on_scene | length > 0 }}"
+                then:
+                  # Turn on with the chosen scene
+                  - action: scene.turn_on
+                    target:
+                      entity_id: "{{ turn_on_scene }}"
+                  - if:
+                      - condition: template
+                        value_template: "{{ turn_on_scene in themes }}"
+                    then:
+                      - action: input_number.set_value
+                        target:
+                          entity_id: "{{ theme_index }}"
+                        data:
+                          value: "{{ themes.index(turn_on_scene) }}"
+                else:
+                  # Resume where it left off
+                  - action: light.turn_on
+                    target:
+                      entity_id: "{{ light_entity }}"
             else:
               # Light is on -> next theme
               - condition: template

@@ -6,9 +6,13 @@ blueprint:
     Button I: if the light is off, turns it on (where it left off, or with a chosen scene).
     If it is on, switches to the next theme (scene).
     Holding I increases brightness.
+    Triple-click I turns on the whole room.
 
     Button O: press turns the light off, hold decreases brightness (only when the light is on).
     Triple-click O always turns off the whole room.
+
+    Presses of I that come within the triple-click window of the previous
+    press count as part of a multi-click and do not switch themes.
   domain: automation
   input:
     remote:
@@ -59,7 +63,9 @@ blueprint:
             - domain: input_number
     room:
       name: Room for triple-click
-      description: What turns off on a triple-click of O (an area or specific lights).
+      description: >
+        What turns on with a triple-click of I and off with a triple-click of O
+        (an area or specific lights).
       selector:
         target:
           entity:
@@ -108,6 +114,11 @@ variables:
   dim_delay: !input dim_delay
   click_window: !input click_window
   step_abs: "{{ (dim_step * 2.55) | int }}"
+  # `this` is the automation state before this run, so last_triggered is the previous press
+  is_followup: >
+    {% set last = this.attributes.last_triggered if this is defined else none %}
+    {{ last is not none
+       and (now() - (last | as_datetime)).total_seconds() * 1000 < click_window }}
 
 triggers:
   - trigger: device
@@ -137,11 +148,14 @@ triggers:
 
 actions:
   - choose:
-      # ---------- Button I: short press ----------
+      # ---------- Button I: press = on / next theme, triple-click = turn on room ----------
       - conditions:
           - condition: trigger
             id: "on"
         sequence:
+          # 2nd and 3rd press of a multi-click are handled by the run of the 1st press
+          - condition: template
+            value_template: "{{ not is_followup }}"
           - if:
               - condition: template
                 value_template: "{{ is_state(light_entity, 'off') }}"
@@ -170,19 +184,47 @@ actions:
                       entity_id: "{{ light_entity }}"
             else:
               # Light is on -> next theme
-              - condition: template
-                value_template: "{{ themes | count > 0 }}"
-              - variables:
-                  next_idx: >
-                    {{ ((states(theme_index) | float(-1) | int) + 1) % (themes | count) }}
-              - action: input_number.set_value
-                target:
-                  entity_id: "{{ theme_index }}"
-                data:
-                  value: "{{ next_idx }}"
-              - action: scene.turn_on
-                target:
-                  entity_id: "{{ themes[next_idx | int] }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ themes | count > 0 }}"
+                then:
+                  - variables:
+                      next_idx: >
+                        {{ ((states(theme_index) | float(-1) | int) + 1) % (themes | count) }}
+                  - action: input_number.set_value
+                    target:
+                      entity_id: "{{ theme_index }}"
+                    data:
+                      value: "{{ next_idx }}"
+                  - action: scene.turn_on
+                    target:
+                      entity_id: "{{ themes[next_idx | int] }}"
+          # second press
+          - wait_for_trigger:
+              - trigger: device
+                domain: mqtt
+                device_id: !input remote
+                type: action
+                subtype: "on"
+            timeout:
+              milliseconds: "{{ click_window }}"
+            continue_on_timeout: true
+          - condition: template
+            value_template: "{{ wait.trigger is not none }}"
+          # third press
+          - wait_for_trigger:
+              - trigger: device
+                domain: mqtt
+                device_id: !input remote
+                type: action
+                subtype: "on"
+            timeout:
+              milliseconds: "{{ click_window }}"
+            continue_on_timeout: true
+          - condition: template
+            value_template: "{{ wait.trigger is not none }}"
+          - action: light.turn_on
+            target: !input room
 
       # ---------- Button I: hold = increase brightness ----------
       - conditions:

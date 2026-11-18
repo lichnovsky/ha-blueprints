@@ -1,0 +1,221 @@
+blueprint:
+  name: Wake-up light
+  description: >
+    Slowly brightens lights before the earliest of the selected alarms.
+
+    Alarms are date-and-time helpers (input_datetime). Only alarms whose time
+    falls inside the wake-up window count, so an 11:30 reminder to cook
+    potatoes will not light up the kitchen.
+
+    The ramp starts the set number of minutes before the alarm and lasts the
+    set duration. If anyone changes a light during the ramp (turns it off,
+    sets it to full brightness…), the automation stops and leaves the lights
+    alone.
+
+    Note: a ramp is not started when the automation is saved, reloaded or
+    Home Assistant restarts after the ramp should already have begun.
+  domain: automation
+  input:
+    alarms:
+      name: Alarms
+      description: >
+        Date-and-time helpers (input_datetime with date and time). The earliest
+        upcoming alarm inside the wake-up window is used.
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - domain: input_datetime
+    lights:
+      name: Lights
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - domain: light
+    lead_time:
+      name: Start before alarm
+      description: How many minutes before the alarm the lights start brightening.
+      default: 30
+      selector:
+        number:
+          min: 1
+          max: 120
+          step: 1
+          unit_of_measurement: min
+    duration:
+      name: Brightening duration
+      description: How long it takes to get from the start to the target brightness.
+      default: 30
+      selector:
+        number:
+          min: 1
+          max: 120
+          step: 1
+          unit_of_measurement: min
+    window_start:
+      name: Wake-up window from
+      description: Alarms earlier than this are ignored.
+      default: "05:00:00"
+      selector:
+        time:
+    window_end:
+      name: Wake-up window to
+      description: Alarms later than this are ignored. Must be after the window start.
+      default: "09:00:00"
+      selector:
+        time:
+    brightness_start:
+      name: Start brightness
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+    brightness_end:
+      name: Target brightness
+      default: 100
+      selector:
+        number:
+          min: 1
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
+    change_color_temp:
+      name: Change color temperature
+      description: Turn off for lights that cannot change color temperature.
+      default: true
+      selector:
+        boolean:
+    color_temp_start:
+      name: Start color temperature
+      default: 2200
+      selector:
+        color_temp:
+          unit: kelvin
+          min: 2000
+          max: 6500
+    color_temp_end:
+      name: Target color temperature
+      default: 3000
+      selector:
+        color_temp:
+          unit: kelvin
+          min: 2000
+          max: 6500
+    step_interval:
+      name: Step interval
+      description: How often the brightness is raised.
+      default: 30
+      selector:
+        number:
+          min: 5
+          max: 300
+          step: 5
+          unit_of_measurement: s
+    skip_if_on:
+      name: Skip if already on
+      description: Do nothing when any of the lights is already on at the start.
+      default: true
+      selector:
+        boolean:
+
+mode: single
+max_exceeded: silent
+
+trigger_variables:
+  alarms: !input alarms
+  lead_time: !input lead_time
+  window_start: !input window_start
+  window_end: !input window_end
+
+triggers:
+  # Re-rendered every minute (because of now()) and whenever an alarm changes.
+  - trigger: template
+    value_template: >
+      {% set now_ts = now().timestamp() %}
+      {% set ns = namespace(next=none) %}
+      {% for e in alarms %}
+        {% set ts = state_attr(e, 'timestamp') %}
+        {% if ts is number and ts > now_ts %}
+          {% set t = ts | timestamp_custom('%H:%M:%S') %}
+          {% if t >= window_start and t <= window_end and (ns.next is none or ts < ns.next) %}
+            {% set ns.next = ts %}
+          {% endif %}
+        {% endif %}
+      {% endfor %}
+      {{ ns.next is not none and now_ts >= ns.next - lead_time * 60 }}
+
+variables:
+  all_lights: !input lights
+  # Unpowered or unreachable lights are left out so they do not stop the ramp.
+  lights: "{{ all_lights | reject('is_state', ['unavailable', 'unknown']) | list }}"
+  duration: !input duration
+  brightness_start: !input brightness_start
+  brightness_end: !input brightness_end
+  change_color_temp: !input change_color_temp
+  color_temp_start: !input color_temp_start
+  color_temp_end: !input color_temp_end
+  step_interval: !input step_interval
+  skip_if_on: !input skip_if_on
+  steps: "{{ [1, (duration * 60 / step_interval) | int] | max }}"
+  # Allowed difference (0–255 scale, ~3 %) between what we set and what the light reports.
+  tolerance: 8
+
+conditions:
+  - condition: template
+    value_template: "{{ lights | count > 0 }}"
+  - condition: template
+    value_template: "{{ not skip_if_on or lights | select('is_state', 'on') | list | count == 0 }}"
+
+actions:
+  # Step 0 turns the lights on at the start values, steps 1..N raise them.
+  - repeat:
+      count: "{{ steps + 1 }}"
+      sequence:
+        - variables:
+            i: "{{ repeat.index - 1 }}"
+            bri: "{{ ((brightness_start + (brightness_end - brightness_start) * i / steps) * 2.55) | round | int }}"
+            prev_bri: "{{ ((brightness_start + (brightness_end - brightness_start) * (i - 1) / steps) * 2.55) | round | int }}"
+            kelvin: "{{ (color_temp_start + (color_temp_end - color_temp_start) * i / steps) | round | int }}"
+        - if:
+            - condition: template
+              value_template: "{{ i > 0 }}"
+          then:
+            - delay:
+                seconds: "{{ step_interval }}"
+            # Someone touched a light: it is off or its brightness is not what we set.
+            # Lights that dropped off the network mid-ramp are ignored.
+            - if:
+                - condition: template
+                  value_template: >
+                    {% set ns = namespace(changed=false) %}
+                    {% for l in lights %}
+                      {% set b = state_attr(l, 'brightness') %}
+                      {% if is_state(l, 'off') or (b is number and (b - prev_bri) | abs > tolerance) %}
+                        {% set ns.changed = true %}
+                      {% endif %}
+                    {% endfor %}
+                    {{ ns.changed }}
+              then:
+                - stop: Light changed manually, wake-up stopped.
+        - if:
+            - condition: template
+              value_template: "{{ change_color_temp }}"
+          then:
+            - action: light.turn_on
+              target:
+                entity_id: "{{ lights }}"
+              data:
+                brightness: "{{ bri }}"
+                color_temp_kelvin: "{{ kelvin }}"
+                transition: "{{ step_interval * 0.8 }}"
+          else:
+            - action: light.turn_on
+              target:
+                entity_id: "{{ lights }}"
+              data:
+                brightness: "{{ bri }}"
+                transition: "{{ step_interval * 0.8 }}"

@@ -10,3 +10,9 @@ Home Assistant blueprints.
 | --- | --- | --- | --- |
 | [IKEA E1743 – light with themes](switches/ikea_tradfri_e1743.yaml) | IKEA TRADFRI on/off switch (E1743) | Zigbee2MQTT | [![Import blueprint](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Flichnovsky%2Fha-blueprints%2Fblob%2Fmain%2Fswitches%2Fikea_tradfri_e1743.yaml) |
 | [IKEA STYRBAR – light with themes](switches/ikea_styrbar_e2001.yaml) | IKEA STYRBAR remote (E2001/E2002) | Zigbee2MQTT | [![Import blueprint](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Flichnovsky%2Fha-blueprints%2Fblob%2Fmain%2Fswitches%2Fikea_styrbar_e2001.yaml) |
+
+### Lights
+
+| Blueprint | Description | Import |
+| --- | --- | --- |
+| [Wake-up light](lights/wakeup_light.yaml) | Gradually brightens lights before the earliest alarm (input_datetime) within a time window; stops on manual change | [![Import blueprint](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Flichnovsky%2Fha-blueprints%2Fblob%2Fmain%2Flights%2Fwakeup_light.yaml) |
